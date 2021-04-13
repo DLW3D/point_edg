@@ -202,6 +202,82 @@ class PointNetSetAbstraction(nn.Module):
         return new_xyz, new_points
 
 
+class PointNetSetAttention(nn.Module):
+    def __init__(self, npoint, radius, nsample, in_channel, mlp, group_all):
+        super(PointNetSetAttention, self).__init__()
+        self.npoint = npoint    # 下采样点数
+        self.radius = radius    # 半径
+        self.nsample = nsample  # 临近点数
+        self.sa = SA_Layer(in_channel)  # 自注意力
+        self.mlp_convs = nn.ModuleList()
+        self.mlp_bns = nn.ModuleList()
+        last_channel = in_channel
+        for out_channel in mlp:
+            self.mlp_convs.append(nn.Conv2d(last_channel, out_channel, 1))
+            self.mlp_bns.append(nn.BatchNorm2d(out_channel))
+            last_channel = out_channel
+        self.group_all = group_all
+
+    def forward(self, xyz, points):
+        """
+        Input:
+            xyz: input points position data, [B, C, N]
+            points: input points data, [B, D, N]
+        Return:
+            new_xyz: sampled points position data, [B, C, S]
+            new_points_concat: sample points feature data, [B, D', S]
+        """
+        xyz = xyz.permute(0, 2, 1)
+        if points is not None:
+            points = points.permute(0, 2, 1)
+
+        if self.group_all:
+            new_xyz, new_points = sample_and_group_all(xyz, points)
+        else:
+            new_xyz, new_points = sample_and_group(self.npoint, self.radius, self.nsample, xyz, points)
+        # new_xyz: sampled points position data, [B, npoint, C]
+        # new_points: sampled points data, [B, npoint, nsample, C+D]
+        new_points = new_points.permute(0, 3, 1, 2)     # [B, C+D, npoint, nsample]
+        new_points = self.sa(new_points)
+        new_points = new_points.permute(0, 1, 3, 2)     # [B, C+D, nsample, npoint]
+        for i, conv in enumerate(self.mlp_convs):
+            bn = self.mlp_bns[i]
+            new_points =  F.relu(bn(conv(new_points)))
+
+        new_points = torch.max(new_points, 2)[0]
+        new_xyz = new_xyz.permute(0, 2, 1)
+        return new_xyz, new_points
+
+
+class SA_Layer(nn.Module):
+    def __init__(self, channels):
+        super(SA_Layer, self).__init__()
+        self.q_conv = nn.Conv2d(channels, channels // 4, kernel_size=1, bias=False)
+        self.k_conv = nn.Conv2d(channels, channels // 4, kernel_size=1, bias=False)
+        # self.q_conv.weight = self.k_conv.weight
+        self.v_conv = nn.Conv2d(channels, channels, kernel_size=1)
+        self.before_conv = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.trans_conv = nn.Conv2d(channels, channels, kernel_size=1)
+        self.before_norm = nn.BatchNorm2d(channels)
+        self.after_norm = nn.BatchNorm2d(channels)
+        self.act = nn.ReLU()
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):   # [B, C+D, npoint, nsample]
+        x = self.act(self.before_norm(self.before_conv(x)))
+        x_q = self.q_conv(x).permute(0, 2, 3, 1)    # [B, npoint, nsample, C+D]
+        x_k = self.k_conv(x).permute(0, 2, 1, 3)    # [B, npoint, C+D, nsample]
+        x_v = self.v_conv(x).permute(0, 2, 1, 3)    # [B, npoint, C+D, nsample]
+        energy = torch.matmul(x_q, x_k)    # [B, npoint, nsample, nsample]
+        attention = self.softmax(energy)
+        attention = attention / (1e-9 + attention.sum(dim=1, keepdim=True))
+        x_r = torch.matmul(x_v, attention)      # [B, npoint, C+D, nsample]
+        x_r = x_r.permute(0, 2, 1, 3)           # [B, C+D, npoint, nsample]
+        x_r = self.act(self.after_norm(self.trans_conv(x - x_r)))
+        x = x + x_r
+        return x
+
+
 class PointNetSetAbstractionMsg(nn.Module):
     def __init__(self, npoint, radius_list, nsample_list, in_channel, mlp_list):
         super(PointNetSetAbstractionMsg, self).__init__()
