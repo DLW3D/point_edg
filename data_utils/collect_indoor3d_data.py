@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 from indoor3d_util import DATA_PATH, collect_point_label
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,5 +21,6 @@ for anno_path in anno_paths:
         elements = anno_path.split('/')
         out_filename = elements[-3]+'_'+elements[-2]+'.npy' # Area_1_hallway_1.npy
         collect_point_label(anno_path, os.path.join(output_folder, out_filename), 'numpy')
+        shutil.rmtree(anno_path[:-12])
     except:
         print(anno_path, 'ERROR!!')
